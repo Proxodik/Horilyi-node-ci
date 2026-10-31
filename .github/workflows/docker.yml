@@ -1,3 +1,4 @@
+
 name: Docker Build and Push
 
 on:
@@ -7,10 +8,19 @@ on:
 
 permissions:
   contents: read
+  id-token: write
+
+concurrency:
+  group: docker-ec2-deploy
+  cancel-in-progress: false
 
 jobs:
   docker:
     runs-on: ubuntu-latest
+    env:
+      EC2_HOST: ${{ secrets.EC2_HOST }}
+      EC2_USER: ${{ secrets.EC2_USER }}
+      SECURITY_GROUP_ID: sg-026a547a176ad80a3
 
     steps:
       - name: Checkout repository
@@ -37,3 +47,78 @@ jobs:
           tags: |
             illiadevops/horilyi-node-ci:latest
             illiadevops/horilyi-node-ci:${{ steps.version.outputs.tag }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::311681428483:role/Horilyi-GitHub-Deploy-Role
+          aws-region: eu-north-1
+
+      - name: Detect runner IP
+        id: runner_ip
+        run: |
+          IP=$(curl -fsS https://checkip.amazonaws.com | tr -d '\n')
+          echo "cidr=${IP}/32" >> "$GITHUB_OUTPUT"
+
+      - name: Temporarily allow SSH
+        id: ssh_access
+        run: |
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SECURITY_GROUP_ID" \
+            --protocol tcp \
+            --port 22 \
+            --cidr "${{ steps.runner_ip.outputs.cidr }}"
+
+      - name: Prepare SSH
+        env:
+          SSH_KEY_B64: ${{ secrets.EC2_SSH_KEY_B64 }}
+          HOST_PUBLIC_KEY: ${{ secrets.EC2_HOST_PUBLIC_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s' "$SSH_KEY_B64" | base64 --decode > ~/.ssh/ec2_key
+          chmod 600 ~/.ssh/ec2_key
+          printf '%s %s\n' "$EC2_HOST" "$HOST_PUBLIC_KEY" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Deploy Docker container to EC2
+        env:
+          IMAGE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          ssh -i ~/.ssh/ec2_key -o StrictHostKeyChecking=yes \
+            "$EC2_USER@$EC2_HOST" \
+            "IMAGE_TAG='$IMAGE_TAG' bash -se" <<'REMOTE'
+          set -e
+          IMAGE="illiadevops/horilyi-node-ci:$IMAGE_TAG"
+
+          sudo docker pull "$IMAGE"
+          sudo docker rm -f horilyi-app || true
+          sudo docker run -d \
+            --name horilyi-app \
+            --restart unless-stopped \
+            -p 127.0.0.1:3001:3000 \
+            "$IMAGE"
+
+          for attempt in 1 2 3 4 5; do
+            if curl -fsS http://127.0.0.1:3001 | grep -q 'Hello CI'; then
+              echo "Docker deployment successful"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          sudo docker logs horilyi-app
+          exit 1
+          REMOTE
+
+      - name: Remove temporary SSH rule
+        if: ${{ always() && steps.ssh_access.outcome == 'success' }}
+        run: |
+          aws ec2 revoke-security-group-ingress \
+            --group-id "$SECURITY_GROUP_ID" \
+            --protocol tcp \
+            --port 22 \
+            --cidr "${{ steps.runner_ip.outputs.cidr }}"
+
+      - name: Remove SSH key
+        if: always()
+        run: rm -f ~/.ssh/ec2_key
