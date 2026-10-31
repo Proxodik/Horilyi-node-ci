@@ -55,6 +55,7 @@ resource "aws_instance" "devops_server" {
   subnet_id                   = sort(data.aws_subnets.default.ids)[0]
   vpc_security_group_ids      = [aws_security_group.devops_sg.id]
   associate_public_ip_address = true
+  iam_instance_profile        = "Horilyi-Terraform-EC2-SSM-Role"
 
   root_block_device {
     volume_size = 8
